@@ -1,8 +1,10 @@
 """
-MiMo Reasoning Content Proxy v1.3
+MiMo Reasoning Content Proxy v1.4
 ==================================
 v1.3: 当缓存未命中时，剥离 assistant 消息的 tool_calls（降级为纯文本），
      避免 400 错误。MiMo 只对有 tool_calls 的 assistant 消息要求 reasoning_content。
+v1.4: 修复非流式模式下上游返回错误时的处理：检查状态码、添加重试逻辑、
+     确保不会返回空 content。
 """
 
 import hashlib
@@ -160,74 +162,100 @@ async def _stream_proxy(client: httpx.AsyncClient, url: str, headers: dict, body
     acc_reasoning = ""
     acc_tool_calls: list[dict] = []
 
-    try:
-        async with client.stream("POST", url, headers=headers, json=body) as resp:
-            if resp.status_code != 200:
-                error_body = await resp.aread()
-                yield _sse(error_body.decode("utf-8", errors="replace"))
+    # 流式模式也加重试（针对 5xx）
+    last_error = None
+    for attempt in range(3):
+        try:
+            async with client.stream("POST", url, headers=headers, json=body) as resp:
+                if resp.status_code != 200:
+                    error_body = await resp.aread()
+                    error_text = error_body.decode("utf-8", errors="replace")
+                    log.warning("⚠️ Stream upstream %d (attempt %d): %s", resp.status_code, attempt + 1, error_text[:200])
+                    if resp.status_code < 500:
+                        yield _sse(error_text)
+                        return
+                    last_error = error_text
+                    if attempt < 2:
+                        import asyncio
+                        await asyncio.sleep(1 * (attempt + 1))
+                        continue
+                    yield _sse(json.dumps({"error": {"message": f"MiMo API error after retries: {last_error[:200]}", "code": "502"}}))
+                    return
+
+                buffer = ""
+                async for raw_chunk in resp.aiter_bytes():
+                    buffer += raw_chunk.decode("utf-8", errors="replace")
+
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.rstrip("\r")
+
+                        if line.startswith("data: "):
+                            payload = line[6:].strip()
+
+                            if payload == "[DONE]":
+                                if acc_reasoning and (acc_content or acc_tool_calls):
+                                    synthetic = {
+                                        "role": "assistant",
+                                        "content": acc_content,
+                                        "tool_calls": acc_tool_calls,
+                                        "reasoning_content": acc_reasoning,
+                                    }
+                                    h = _msg_hash(synthetic)
+                                    tc_ids = _extract_tool_call_ids(synthetic)
+                                    _cache_set_with_index(h, acc_reasoning, tc_ids)
+                                    log.info("📦 Cached streaming reasoning [%s] (%d chars)", h[:8], len(acc_reasoning))
+                                yield _sse("[DONE]")
+                                continue
+
+                            try:
+                                chunk = json.loads(payload)
+                                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                                rc = delta.get("reasoning_content")
+                                if rc:
+                                    acc_reasoning += rc
+                                c = delta.get("content")
+                                if c:
+                                    acc_content += c
+                                for tc in delta.get("tool_calls") or []:
+                                    idx = tc.get("index", 0)
+                                    while len(acc_tool_calls) <= idx:
+                                        acc_tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                                    if tc.get("id"):
+                                        acc_tool_calls[idx]["id"] = tc["id"]
+                                    fn = tc.get("function", {})
+                                    if fn.get("name"):
+                                        acc_tool_calls[idx]["function"]["name"] += fn["name"]
+                                    if fn.get("arguments"):
+                                        acc_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+                            except (json.JSONDecodeError, IndexError, KeyError):
+                                pass
+
+                            yield _sse(payload)
+
+                        elif line.strip() == "":
+                            yield b"\n"
+                        elif line.startswith(":"):
+                            yield (line + "\n\n").encode("utf-8")
+                        else:
+                            yield (line + "\n").encode("utf-8")
+                # 流成功完成，退出重试循环
                 return
 
-            buffer = ""
-            async for raw_chunk in resp.aiter_bytes():
-                buffer += raw_chunk.decode("utf-8", errors="replace")
+        except httpx.TimeoutException as e:
+            log.warning("⚠️ Stream timeout (attempt %d): %s", attempt + 1, e)
+            last_error = str(e)
+            if attempt < 2:
+                import asyncio
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+        except Exception as e:
+            log.error("❌ Stream error: %s", e, exc_info=True)
+            yield _sse(json.dumps({"error": f"Proxy error: {e}"}))
+            return
 
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.rstrip("\r")
-
-                    if line.startswith("data: "):
-                        payload = line[6:].strip()
-
-                        if payload == "[DONE]":
-                            if acc_reasoning and (acc_content or acc_tool_calls):
-                                synthetic = {
-                                    "role": "assistant",
-                                    "content": acc_content,
-                                    "tool_calls": acc_tool_calls,
-                                    "reasoning_content": acc_reasoning,
-                                }
-                                h = _msg_hash(synthetic)
-                                tc_ids = _extract_tool_call_ids(synthetic)
-                                _cache_set_with_index(h, acc_reasoning, tc_ids)
-                                log.info("📦 Cached streaming reasoning [%s] (%d chars)", h[:8], len(acc_reasoning))
-                            yield _sse("[DONE]")
-                            continue
-
-                        try:
-                            chunk = json.loads(payload)
-                            delta = chunk.get("choices", [{}])[0].get("delta", {})
-                            rc = delta.get("reasoning_content")
-                            if rc:
-                                acc_reasoning += rc
-                            c = delta.get("content")
-                            if c:
-                                acc_content += c
-                            for tc in delta.get("tool_calls") or []:
-                                idx = tc.get("index", 0)
-                                while len(acc_tool_calls) <= idx:
-                                    acc_tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                                if tc.get("id"):
-                                    acc_tool_calls[idx]["id"] = tc["id"]
-                                fn = tc.get("function", {})
-                                if fn.get("name"):
-                                    acc_tool_calls[idx]["function"]["name"] += fn["name"]
-                                if fn.get("arguments"):
-                                    acc_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
-                        except (json.JSONDecodeError, IndexError, KeyError):
-                            pass
-
-                        yield _sse(payload)
-
-                    elif line.strip() == "":
-                        yield b"\n"
-                    elif line.startswith(":"):
-                        yield (line + "\n\n").encode("utf-8")
-                    else:
-                        yield (line + "\n").encode("utf-8")
-
-    except Exception as e:
-        log.error("❌ Stream error: %s", e, exc_info=True)
-        yield _sse(json.dumps({"error": f"Proxy error: {e}"}))
+    # 所有重试都失败
+    yield _sse(json.dumps({"error": {"message": f"Stream error after retries: {last_error}", "code": "502"}}))
 
 
 # ─── HTTP 端点 ─────────────────────────────────────────────────
@@ -259,16 +287,68 @@ async def chat_completions(request: Request):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
         )
     else:
-        try:
-            resp = await client.post(upstream, headers=headers, json=body)
-            data = resp.json()
-            if resp.status_code == 200:
-                for choice in data.get("choices", []):
+        # 非流式：重试逻辑处理 MiMo 偶发 500
+        last_error = None
+        for attempt in range(3):
+            try:
+                resp = await client.post(upstream, headers=headers, json=body)
+                if resp.status_code != 200:
+                    error_text = resp.text
+                    log.warning("⚠️ Upstream %d (attempt %d): %s", resp.status_code, attempt + 1, error_text[:200])
+                    # 4xx 错误不重试（参数问题），5xx 重试
+                    if resp.status_code < 500:
+                        return JSONResponse(
+                            {"error": {"message": f"Upstream error: {error_text[:200]}", "code": str(resp.status_code)}},
+                            status_code=resp.status_code,
+                        )
+                    last_error = error_text
+                    if attempt < 2:
+                        import asyncio
+                        await asyncio.sleep(1 * (attempt + 1))
+                        continue
+                    # 最后一次仍然失败
+                    return JSONResponse(
+                        {"error": {"message": f"MiMo API error after 3 attempts: {last_error[:200]}", "code": "502"}},
+                        status_code=502,
+                    )
+
+                data = resp.json()
+
+                # 检查返回数据是否有效
+                choices = data.get("choices", [])
+                if not choices:
+                    log.warning("⚠️ Empty choices in response")
+                    return JSONResponse(
+                        {"error": {"message": "MiMo API returned empty choices", "code": "502"}},
+                        status_code=502,
+                    )
+
+                # 检查 content 是否为空（MiMo 有时只返回 reasoning_content）
+                msg = choices[0].get("message", {})
+                if not msg.get("content") and not msg.get("tool_calls") and msg.get("reasoning_content"):
+                    log.warning("⚠️ Response has reasoning_content but no content, setting fallback")
+                    msg["content"] = msg["reasoning_content"]
+
+                for choice in choices:
                     cache_reasoning_from_message(choice.get("message", {}))
-            return JSONResponse(content=data, status_code=resp.status_code)
-        except Exception as e:
-            log.error("❌ Error: %s", e, exc_info=True)
-            return JSONResponse({"error": str(e)}, status_code=500)
+
+                return JSONResponse(content=data, status_code=200)
+
+            except httpx.TimeoutException as e:
+                log.warning("⚠️ Timeout (attempt %d): %s", attempt + 1, e)
+                last_error = str(e)
+                if attempt < 2:
+                    import asyncio
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+            except Exception as e:
+                log.error("❌ Error: %s", e, exc_info=True)
+                return JSONResponse({"error": {"message": str(e), "code": "500"}}, status_code=500)
+
+        return JSONResponse(
+            {"error": {"message": f"Proxy error after retries: {last_error}", "code": "502"}},
+            status_code=502,
+        )
 
 
 async def list_models(request: Request):
@@ -322,5 +402,5 @@ app = Starlette(routes=routes, lifespan=lifespan)
 if __name__ == "__main__":
     import uvicorn
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
-    log.info("🚀 MiMo Proxy v1.3 on %s:%d → %s", LISTEN_HOST, LISTEN_PORT, MIMO_API_BASE)
+    log.info("🚀 MiMo Proxy v1.4 on %s:%d → %s", LISTEN_HOST, LISTEN_PORT, MIMO_API_BASE)
     uvicorn.run(app, host=LISTEN_HOST, port=LISTEN_PORT, log_level="info")
