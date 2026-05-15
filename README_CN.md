@@ -58,10 +58,17 @@ python mimo_proxy.py
 2. 将 **Custom Request URL** 改为：
 
 ```
-http://<代理IP>:8899/v1/chat/completions
+http://127.0.0.1:8899/v1/chat/completions
 ```
 
-3. API Key 保持不变
+> ⚠️ **常见错误：**
+> - ❌ `http://0.0.0.0:8899/v1` — `0.0.0.0` 是监听地址，不能用来访问
+> - ❌ `http://127.0.0.1:8899/v1` — 路径不完整
+> - ✅ `http://127.0.0.1:8899/v1/chat/completions` — 正确格式
+>
+> 如果代理部署在其他机器上，将 `127.0.0.1` 替换为该机器的 IP 地址。
+
+3. API Key 填你的 MiMo API Key
 4. Thinking Mode 可以保持开启
 
 ## 配置参数

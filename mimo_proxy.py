@@ -403,4 +403,30 @@ if __name__ == "__main__":
     import uvicorn
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
     log.info("🚀 MiMo Proxy v1.4 on %s:%d → %s", LISTEN_HOST, LISTEN_PORT, MIMO_API_BASE)
+    
+    # 显示正确的 Trae 配置地址
+    import socket
+    local_ip = "127.0.0.1"
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        pass
+    
+    print()
+    print("=" * 60)
+    print("  ✅ 代理已启动！请在 Trae 中配置以下地址：")
+    print()
+    print(f"  本机访问: http://127.0.0.1:{LISTEN_PORT}/v1/chat/completions")
+    print(f"  局域网:   http://{local_ip}:{LISTEN_PORT}/v1/chat/completions")
+    print()
+    print("  ⚠️  注意：")
+    print("  1. 地址必须是完整路径，包含 /v1/chat/completions")
+    print("  2. 不要用 0.0.0.0，那是监听地址不是访问地址")
+    print("  3. API Key 填你的 MiMo API Key")
+    print("=" * 60)
+    print()
+    
     uvicorn.run(app, host=LISTEN_HOST, port=LISTEN_PORT, log_level="info")
