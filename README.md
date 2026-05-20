@@ -36,6 +36,21 @@ Trae → MiMo Reasoning Proxy → MiMo API
 
 ## 快速开始
 
+### Docker（推荐）
+
+```bash
+# 拉取镜像
+docker pull ghcr.io/mintneko/mimo-proxy:latest
+
+# 运行
+docker run -d --name mimo-proxy -p 8899:8899 \
+  ghcr.io/mintneko/mimo-proxy:latest
+```
+
+支持 `linux/amd64` 和 `linux/arm64`（Apple Silicon / ARM 服务器）。
+
+### 手动安装
+
 ### 安装依赖
 
 ```bash
@@ -81,6 +96,21 @@ http://127.0.0.1:8899/v1/chat/completions
 如果使用按量付费 API，将 `MIMO_API_BASE` 改为：
 ```
 https://api.xiaomimimo.com/v1
+```
+
+### Docker Compose（可选）
+
+```yaml
+services:
+  mimo-proxy:
+    image: ghcr.io/mintneko/mimo-proxy:latest
+    ports:
+      - "8899:8899"
+    restart: unless-stopped
+```
+
+```bash
+docker compose up -d
 ```
 
 ## Systemd 服务（可选）
